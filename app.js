@@ -257,6 +257,10 @@ function renderAll() {
   renderSettings();
 }
 
+function getLocalNotificationsPlugin() {
+  return window.Capacitor?.Plugins?.LocalNotifications || null;
+}
+
 function renderToday() {
   const now = new Date();
   const todayKey = dateToKey(now);
@@ -424,8 +428,8 @@ function renderSettings() {
         <article class="task-card">
           <header>
             <div>
-              <div class="task-title">Browser reminders</div>
-              <p class="task-subtitle">High-priority nudges for due medicines and time-bound actions.</p>
+              <div class="task-title">Local reminders</div>
+              <p class="task-subtitle">System notifications for due medicines and time-bound actions.</p>
             </div>
             <button class="secondary-button" data-action="enable-notifications">Enable</button>
           </header>
@@ -1131,32 +1135,136 @@ function triggerSkipCardAction(action) {
   skipOccurrence(action.taskId, action.occurrenceId);
 }
 
-function notifyDueItems() {
-  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  const now = new Date();
-  const todayKey = dateToKey(now);
-  const due = buildTodayItems(now).filter((item) => item.state === "due");
-  due.forEach((item) => {
-    const reminderKey = `${todayKey}:${item.taskId}:${item.occurrenceId}`;
-    const alreadySent = state.reminderAlerts[reminderKey];
-    const refMinutes = item.timeLabel ? timeToMinutes(extractTimeFromLabel(item.timeLabel)) : minutesSinceMidnight(now);
-    const shouldNotify = refMinutes === null || Math.abs(minutesSinceMidnight(now) - refMinutes) <= DEFAULT_NOTIFICATION_WINDOW_MINUTES;
-    if (!alreadySent && shouldNotify) {
-      new Notification("Discipline OS", { body: `${item.title}${item.timeLabel ? ` · ${item.timeLabel}` : ""}` });
-      state.reminderAlerts[reminderKey] = now.toISOString();
-    }
-  });
-  syncState();
+async function notifyDueItems() {
+  const plugin = getLocalNotificationsPlugin();
+  if (!plugin) return;
+  try {
+    const permissions = await plugin.checkPermissions();
+    if (permissions.display !== "granted") return;
+    await syncNativeNotifications();
+  } catch (error) {
+    console.warn("Local notification sync failed", error);
+  }
 }
 
-function requestNotifications() {
-  if (typeof Notification === "undefined") {
-    alert("Notifications are not supported in this browser.");
+async function requestNotifications() {
+  const plugin = getLocalNotificationsPlugin();
+  if (!plugin) {
+    alert("Local notifications are available inside the Capacitor Android app after the plugin is installed and synced.");
     return;
   }
-  Notification.requestPermission().then((permission) => {
-    if (permission === "granted") notifyDueItems();
+  try {
+    const permissions = await plugin.requestPermissions();
+    if (permissions.display !== "granted") {
+      alert("Notification permission was not granted.");
+      return;
+    }
+    await scheduleTestNotification();
+    await syncNativeNotifications();
+  } catch (error) {
+    console.warn("Local notification permission request failed", error);
+  }
+}
+
+async function scheduleTestNotification() {
+  const plugin = getLocalNotificationsPlugin();
+  if (!plugin) return;
+  await plugin.schedule({
+    notifications: [
+      {
+        title: "Reminder",
+        body: "Complete your task",
+        id: 900001,
+        schedule: { at: new Date(Date.now() + 60000) },
+      },
+    ],
   });
+}
+
+async function syncNativeNotifications() {
+  const plugin = getLocalNotificationsPlugin();
+  if (!plugin) return;
+
+  const pending = await plugin.getPending();
+  if (pending.notifications?.length) {
+    await plugin.cancel({
+      notifications: pending.notifications.map((notification) => ({ id: notification.id })),
+    });
+  }
+
+  const notifications = buildNativeNotifications(new Date());
+  if (!notifications.length) return;
+  await plugin.schedule({ notifications });
+}
+
+function buildNativeNotifications(now) {
+  const notifications = [];
+  const tasks = state.tasks.filter((task) => task.active !== false);
+
+  tasks.forEach((task) => {
+    buildNotificationTimesForTask(task, now).forEach((entry, index) => {
+      notifications.push({
+        title: task.category === "Medicines" ? "Medicine reminder" : "Task reminder",
+        body: `${task.name}${entry.label ? ` - ${entry.label}` : ""}`,
+        id: buildNotificationId(task.id, entry.at, index),
+        schedule: { at: entry.at },
+      });
+    });
+  });
+
+  return notifications.slice(0, 64);
+}
+
+function buildNotificationTimesForTask(task, now) {
+  const entries = [];
+
+  if (task.type === "frequency" && task.slotWindows?.length) {
+    task.slotWindows.forEach((slot) => {
+      const nextAt = nextScheduledDateForTask(task, slot.time || slot.start, now);
+      if (nextAt) entries.push({ at: nextAt, label: slot.label || "" });
+    });
+    return entries;
+  }
+
+  const sourceTimes = task.reminderTimes?.length ? task.reminderTimes : task.startTime ? [task.startTime] : [];
+  sourceTimes.forEach((time, index) => {
+    const nextAt = nextScheduledDateForTask(task, time, now);
+    if (nextAt) {
+      entries.push({ at: nextAt, label: sourceTimes.length > 1 ? `Reminder ${index + 1}` : "" });
+    }
+  });
+
+  return entries;
+}
+
+function nextScheduledDateForTask(task, time, now) {
+  if (!time) return null;
+  const maxDaysAhead = task.frequency === "interval" ? Math.max(14, Number(task.intervalDays || 1) * 3) : 7;
+
+  for (let offset = 0; offset <= maxDaysAhead; offset += 1) {
+    const date = addDays(startOfDay(now), offset);
+    if (!isTaskScheduledForDate(task, date)) continue;
+    const at = combineDateAndTime(date, time);
+    if (at > now) return at;
+  }
+
+  return null;
+}
+
+function combineDateAndTime(date, time) {
+  const [hours, minutes] = time.split(":").map(Number);
+  const next = new Date(date);
+  next.setHours(hours || 0, minutes || 0, 0, 0);
+  return next;
+}
+
+function buildNotificationId(taskId, date, index) {
+  const base = `${taskId}:${date.toISOString()}:${index}`;
+  let hash = 0;
+  for (let i = 0; i < base.length; i += 1) {
+    hash = (hash * 31 + base.charCodeAt(i)) % 2000000000;
+  }
+  return Math.max(1000, hash);
 }
 
 function exportData() {
